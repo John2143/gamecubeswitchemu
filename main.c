@@ -60,8 +60,41 @@ unsigned int *gpioP(){
             fdgpio,0);
     fprintf(stderr, "mmap'd gpiomem at pointer %p\n",gpio);
 
-    // Read pin 8, by accessing bit 8 of GPLEV0
     return gpio;
+}
+
+static volatile uint32_t *preciseTimerptr;
+
+uint64_t readPrecise(){
+    uint64_t time = 0;
+    time = *preciseTimerptr;
+    time |= (uint64_t) *(preciseTimerptr + 1) << 32;
+    return time;
+}
+
+void gimmespeed(){
+    int fd;
+    void *timerBase;
+
+    if (-1 == (fd = open("/dev/mem", O_RDWR))) {
+        fprintf(stderr, "open() failed.\n");
+        return;
+    }
+
+#define DIVIDER 0x40000000
+#define DIVIDER_OFFSET 0x8
+#define PRECISE_TIMER_OFFSET 0x1c
+
+    if (MAP_FAILED == (timerBase = mmap(NULL, 4096,
+                        PROT_READ + PROT_WRITE, MAP_SHARED, fd, DIVIDER))) {
+        fprintf(stderr, "mmap() failed.\n");
+        return;
+    }
+
+    uint32_t *divider = (uint32_t *) ((char *) timerBase + DIVIDER_OFFSET);
+    preciseTimerptr = (uint32_t *) ((char *) timerBase + PRECISE_TIMER_OFFSET);
+    fprintf(stderr, "%x\n", *divider);
+    *divider = 0x06AAAAAA;
 }
 
 volatile uint64_t *timer;
@@ -72,11 +105,17 @@ volatile uint64_t *timer;
 #define wholelottanothing() while(*timer <= time);
 
 void waitOneUS(){
-    int f = 95 / 1.10;
-    while(--f){
-        NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1;
-        NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1;
-    }
+    uint64_t time = readPrecise();
+    while(readPrecise() == time);
+
+    /*uint64_t time = *timer;*/
+    /*while(*timer == time);*/
+
+    /*const int f = 95 / 1.10;*/
+    /*while(--f){*/
+        /*NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1;*/
+        /*NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1; NOOP1;*/
+    /*}*/
 }
 
 void sendBit(int n){
@@ -111,7 +150,7 @@ void sendByte(unsigned char b){
 static char *controller;
 static uint64_t times[10];
 static uint64_t oldtimes[10];
-static uint8_t data[9];
+static uint8_t data[11];
 void gamerTime(int hasgamed){
     for(int i = 0; i < 10; i++){
         oldtimes[i] = times[i];
@@ -120,6 +159,7 @@ void gamerTime(int hasgamed){
 
 	pinMode(CONTROLLER, OUTPUT);
     digitalWrite(CONTROLLER, 1);
+    waitOneUS();
     times[0] = *timer;
 
     /*uint64_t startTime = *timer;*/
@@ -151,7 +191,6 @@ void gamerTime(int hasgamed){
         sendByte(0x00);
         sendBit(1);
     }
-    pinMode(CONTROLLER, INPUT);
 
     /*
     uint64_t endTime = *timer - startTime;
@@ -162,10 +201,11 @@ void gamerTime(int hasgamed){
     fprintf(stderr, "\r");
     */
     times[1] = *timer;
+    pinMode(CONTROLLER, INPUT);
     FILE *ff = fopen(controller, "rb");
     /*fseek(ff, 0, SEEK_SET);*/
     times[2] = *timer;
-    fread(data, 9, 1, ff);
+    fread(data, 11, 1, ff);
     times[3] = *timer;
     fclose(ff);
     times[4] = *timer;
@@ -187,14 +227,17 @@ int main(int argc, char *argv[]) {
     timer = getHWTimer();
     start = *timer;
 
+    gimmespeed();
 	wiringPiSetup();
 	pinMode(CONTROLLER, INPUT);
     //pinMode(0, INPUT);
     gpio = gpioP();
     fprintf(stderr, "setup took %lldus\n", *timer - start);
 
+#ifdef FORK
     int cp = fork();
     if(cp > 0){
+#endif
         uint64_t time0=0, time1=0;
         int lastVal = 1 << 4;
         int data[64];
@@ -203,7 +246,6 @@ int main(int argc, char *argv[]) {
         for(;;){
             int f = gpio[13] & (1 << HARDWARE);
             if(f){
-
                 time1++;
                 if(time1 == 100){
                     char stuff = 0;
@@ -226,9 +268,10 @@ int main(int argc, char *argv[]) {
                         gamerTime(2);
                         int timeTaken = oldtimes[1] - oldtimes[0];
                         if(timeTaken > 275 || timeTaken < 255 || true){
-                            fprintf(stderr, "  %lldus \r", oldtimes[1] - oldtimes[0]);
+                            fprintf(stderr, "  %lldus ", oldtimes[1] - oldtimes[0]);
                         }
                     }
+                    fprintf(stderr, "  stuff was %x \r", stuff);
 
                     /*
                     fprintf(stderr, "%i data\n", datap);
@@ -239,9 +282,10 @@ int main(int argc, char *argv[]) {
                     fprintf(stderr, "\n");
                     */
                     datap = 0;
+
                     const struct timespec ms5 = {
                         .tv_sec = 0,
-                        .tv_nsec = 2e6,
+                        .tv_nsec = 3e6/19.2,
                     };
                     nanosleep(&ms5, NULL);
                 }
@@ -256,6 +300,7 @@ int main(int argc, char *argv[]) {
                 time1 = 0;
             }
         }
+#ifdef FORK
     }else{
         /*while((gpio[13] & (1 << 26)) == 1);*/
 #define maxN 1000000
@@ -270,5 +315,6 @@ int main(int argc, char *argv[]) {
         }
         fprintf(stderr, "child ded\n;");
     }
+#endif
     return 0;
 }
