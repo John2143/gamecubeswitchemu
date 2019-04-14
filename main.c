@@ -156,19 +156,50 @@ void sendByte(unsigned char b){
  * Hash is already checked before this program *
  */
 
+enum CONTROLLER_MACRO {
+    CONTROLLER_MACRO_RESET_DEFAULT = 1 << 0,
+    CONTROLLER_MACRO_DISCONNECT = 1 << 1,
+    CONTROLLER_MACRO_DASHER_DANCER = 1 << 2,
+};
+
+
 #define CONTROLLER_INPUT_SIZE 11
 static uint8_t data[CONTROLLER_INPUT_SIZE];
+static uint8_t defaultControllerState[CONTROLLER_INPUT_SIZE];
+
+static int counter = 0;
+void readControllerState(){
+    FILE *ff = fopen(CONTROLLER_FILE, "rb");
+    fread(data, CONTROLLER_INPUT_SIZE, 1, ff);
+    fclose(ff);
+
+    if(data[10] & CONTROLLER_MACRO_RESET_DEFAULT){
+        memcpy(defaultControllerState, data, 11);
+    }else if(data[10] & CONTROLLER_MACRO_DASHER_DANCER){
+        data[3] = ((counter++ / 2) % 2) ? 0xff : 0x00;
+    }
+}
 
 //Hasgamed can be one of 3 states:
 //  0: Send first controller info: 0x9 0x0 0x0
 //  1: Send controller origin packet, with deadzone info (TODO improvements)
 //  2: Send controller data
 uint64_t gamerTime(int hasgamed){
+    //simulate disconnect
+    if(data[10] & CONTROLLER_MACRO_DISCONNECT){
+        readControllerState();
+        return 0;
+    }
+    if(!(data[0] & 0x1)){
+        readControllerState();
+        return 0;
+    }
 	pinMode(CONTROLLER, OUTPUT);
     //prevent accidental 1 bit being written
     pinon(HARDWARE);
     //Wait to be on a boundary so that our timing can be a bit more accurate
     uint64_t start = waitOneUSTime();
+
 
     switch(hasgamed){
         case 2:
@@ -183,14 +214,14 @@ uint64_t gamerTime(int hasgamed){
             sendBit(1);
             break;
         case 1:
-            sendByte(data[1]);
-            sendByte(data[2]);
-            sendByte(data[3]);
-            sendByte(data[4]);
-            sendByte(data[5]);
-            sendByte(data[6]);
-            sendByte(data[7]);
-            sendByte(data[8]);
+            sendByte(defaultControllerState[1]);
+            sendByte(defaultControllerState[2]);
+            sendByte(defaultControllerState[3]);
+            sendByte(defaultControllerState[4]);
+            sendByte(defaultControllerState[5]);
+            sendByte(defaultControllerState[6]);
+            sendByte(defaultControllerState[7]);
+            sendByte(defaultControllerState[8]);
             sendByte(0x02);
             sendByte(0x02);
             sendBit(1);
@@ -209,9 +240,7 @@ uint64_t gamerTime(int hasgamed){
 
     //read in controller state from file:
     //TODO mmap this
-    FILE *ff = fopen(CONTROLLER_FILE, "rb");
-    fread(data, CONTROLLER_INPUT_SIZE, 1, ff);
-    fclose(ff);
+    readControllerState();
 
     return start;
 }
@@ -222,6 +251,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "bad args: ./xxx controllerFile wiringPiPin BCMPin");
         return 1;
     }
+    //7 4
+    //13 23
+    //0 17
 
     CONTROLLER_FILE = argv[1];
     CONTROLLER = atoi(argv[2]);
@@ -252,8 +284,8 @@ int main(int argc, char *argv[]) {
     int time0=0, time1=0;
     int lastVal = 1 << HARDWARE;
     //the max byte length should be 3 (24 bits), but alloc some extra just in case
-    bool data[32];
-    int datap = 0;
+    bool rawInBits[32];
+    int inBitPtr = 0;
 
     int stateLevel = 0;
 
@@ -263,15 +295,17 @@ int main(int argc, char *argv[]) {
             time1++;
             if(time1 == 100){
                 char stuff = 0;
-                for(int i = 1; i < datap; i++){
-                    stuff |= data[i] << (8 - i);
+                for(int i = 1; i < inBitPtr; i++){
+                    stuff |= rawInBits[i] << (8 - i);
                 }
 
                 uint64_t totalTime;
                 start = readPrecise();
                 if(unlikely(stuff == 0)){
                     totalTime = gamerTime(0);
-                    fprintf(stderr, "\nnew connection request with state level %i\n", stateLevel++);
+                    if(data[0] & 0x1){
+                        fprintf(stderr, "\nnew connection request with state level %i\n", stateLevel++);
+                    }
                 }else if(unlikely(stuff == 0x41)){
                     totalTime = gamerTime(1);
                 }else{
@@ -279,23 +313,25 @@ int main(int argc, char *argv[]) {
                 }
                 start = readPrecise() - start;
                 if(totalTime > 262){
-                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KRED " MISINPUT    \r", stuff, start, totalTime);
+                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KRED " MISINPUT        \r", stuff, start, totalTime);
                 }else if(start > 310){
-                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KYEL " DISKIO?     \r", stuff, start, totalTime);
+                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KYEL " DISKIO?         \r", stuff, start, totalTime);
+                }else if(!(data[0] & 0x1)){
+                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KBLU "DISCONN          \r", stuff, start, totalTime);
                 }else{
-                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KGRN "          OK \r", stuff, start, totalTime);
+                fprintf(stderr, KNRM "req %x, %llius(taken) %llius(signal) " KGRN "          OK     \r", stuff, start, totalTime);
                 }
                 fprintf(stderr, KNRM);
 
                 //reset data once we have written our state
-                datap = 0;
+                inBitPtr = 0;
 
                 //we can yield for a short amount of time. 
                 // ~5.8ms maximum - linux overhead
                 // also apply downscaled timer here)
                 const struct timespec ms5 = {
                     .tv_sec = 0,
-                    .tv_nsec = 3e6/19.2,
+                    .tv_nsec = 2e6/19.2,
                 };
                 nanosleep(&ms5, NULL);
             }
@@ -307,11 +343,11 @@ int main(int argc, char *argv[]) {
         lastVal = f;
         //wait for falling edge to decide bit
         if(!f){
-            if(datap == 32){
-                fprintf(stderr, "\n preventing segfault, datap too high :(\n");
-                datap = 0;
+            if(inBitPtr == 32){
+                fprintf(stderr, "\n preventing segfault, inBitPtr too high :(\n");
+                inBitPtr = 0;
             }
-            data[datap++] = time0 < time1;
+            rawInBits[inBitPtr++] = time0 < time1;
             time0 = 0;
             time1 = 0;
         }
